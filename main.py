@@ -1,16 +1,22 @@
+import json
 import logging
 import os
-import json
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# OpenAI-compatible endpoint (OpenRouter on Railway, local router on dev)
+# Optional OpenClaw bridge webhook (recommended for remote control mode)
+# If set, every inbound text is forwarded first.
+OPENCLAW_WEBHOOK_URL = os.getenv("OPENCLAW_WEBHOOK_URL", "").strip()
+OPENCLAW_WEBHOOK_TOKEN = os.getenv("OPENCLAW_WEBHOOK_TOKEN", "").strip()
+
+# Fallback LLM (when OpenClaw bridge URL is not configured)
 LLM_API_URL = os.getenv(
     "LLM_API_URL",
     os.getenv("LLM_ROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"),
@@ -18,51 +24,136 @@ LLM_API_URL = os.getenv(
 LLM_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
 
+# Security: only owner(s) can use bot
+OWNER_IDS = {
+    s.strip()
+    for s in os.getenv("ALLOW_FROM", os.getenv("OWNER_IDS", "5623991355")).split(",")
+    if s.strip()
+}
+
+
+def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 60) -> dict:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = Request(url, data=data, headers=req_headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+        if not body.strip():
+            return {}
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"text": body}
+
+
+def call_openclaw_bridge(text: str, user_id: str, chat_id: str) -> str:
+    if not OPENCLAW_WEBHOOK_URL:
+        return ""
+
+    headers = {}
+    if OPENCLAW_WEBHOOK_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_WEBHOOK_TOKEN}"
+
+    payload = {
+        "text": text,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "source": "telegram-railway-bot",
+    }
+
+    try:
+        data = _post_json(OPENCLAW_WEBHOOK_URL, payload, headers=headers, timeout=90)
+        # Accept common response keys
+        reply = (
+            data.get("reply")
+            or data.get("text")
+            or data.get("message")
+            or ""
+        )
+        return str(reply).strip()
+    except (HTTPError, URLError, OSError) as e:
+        logger.exception("OpenClaw bridge error")
+        return f"OpenClaw bridge 오류: {e}"
+
 
 def get_llm_reply(text: str) -> str:
-    """Send a chat completion request via OpenAI-compatible API."""
-    body = json.dumps({
+    body = {
         "model": LLM_MODEL,
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 1024,
-    }).encode("utf-8")
-
+    }
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
-    req = Request(LLM_API_URL, data=body, headers=headers, method="POST")
-
     try:
-        with urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-            return (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                or "응답이 비어 있습니다."
-            ).strip()
+        data = _post_json(LLM_API_URL, body, headers=headers, timeout=60)
+        return (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            or "응답이 비어 있습니다."
+        ).strip()
     except (HTTPError, URLError, OSError) as e:
         logger.exception("LLM API error")
         return f"LLM 요청 오류: {e}"
 
 
+def is_allowed(update: Update) -> bool:
+    uid = str(update.effective_user.id) if update.effective_user else ""
+    return uid in OWNER_IDS
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("안녕하세요! 봇이 정상 실행 중입니다 ✅")
+    if not is_allowed(update):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+    mode = "openclaw-bridge" if OPENCLAW_WEBHOOK_URL else "llm-fallback"
+    await update.message.reply_text(f"봇 정상 실행 ✅ (mode={mode})")
 
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_text = update.message.text or ""
-    try:
-        reply = get_llm_reply(user_text)
-    except Exception as e:
-        logger.exception("llm error")
-        reply = f"오류가 발생했습니다: {e}"
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+    await update.message.reply_text("pong")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+    token_source = "env" if os.getenv("TELEGRAM_BOT_TOKEN", "").strip() else "none"
+    running = True
+    await update.message.reply_text(
+        f"running={running}\n"
+        f"tokenSource={token_source}\n"
+        f"bridge={'on' if OPENCLAW_WEBHOOK_URL else 'off'}\n"
+        f"owners={','.join(sorted(OWNER_IDS))}"
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+
+    text = (update.message.text or "").strip()
+    uid = str(update.effective_user.id) if update.effective_user else ""
+    cid = str(update.effective_chat.id) if update.effective_chat else ""
+
+    reply = ""
+    # 1) Try OpenClaw bridge first
+    if OPENCLAW_WEBHOOK_URL:
+        reply = call_openclaw_bridge(text, uid, cid)
+
+    # 2) Fallback to LLM
+    if not reply:
+        reply = get_llm_reply(text)
+
     await update.message.reply_text(reply[:3500])
-
-
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("ok")
 
 
 def main() -> None:
@@ -72,10 +163,16 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("health", health))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot starting polling (API=%s, model=%s)...", LLM_API_URL, LLM_MODEL)
+    logger.info(
+        "Bot starting polling (bridge=%s, llm_api=%s, owners=%s)",
+        bool(OPENCLAW_WEBHOOK_URL),
+        LLM_API_URL,
+        sorted(OWNER_IDS),
+    )
     app.run_polling(drop_pending_updates=True)
 
 
