@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 OPENCLAW_WEBHOOK_URL = os.getenv("OPENCLAW_WEBHOOK_URL", "").strip()
 OPENCLAW_WEBHOOK_TOKEN = os.getenv("OPENCLAW_WEBHOOK_TOKEN", "").strip()
 
-# Fallback LLM (when OpenClaw bridge URL is not configured)
+# Fallback LLM (disabled by default for tighter security)
+ENABLE_LLM_FALLBACK = os.getenv("ENABLE_LLM_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 LLM_API_URL = os.getenv(
     "LLM_API_URL",
     os.getenv("LLM_ROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"),
@@ -110,7 +111,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text("권한이 없습니다.")
         return
-    mode = "openclaw-bridge" if OPENCLAW_WEBHOOK_URL else "llm-fallback"
+    if OPENCLAW_WEBHOOK_URL:
+        mode = "openclaw-bridge"
+    else:
+        mode = "llm-fallback" if ENABLE_LLM_FALLBACK else "bridge-required"
     await update.message.reply_text(f"봇 정상 실행 ✅ (mode={mode})")
 
 
@@ -149,9 +153,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if OPENCLAW_WEBHOOK_URL:
         reply = call_openclaw_bridge(text, uid, cid)
 
-    # 2) Fallback to LLM
+    # 2) Optional fallback to LLM
     if not reply:
-        reply = get_llm_reply(text)
+        if ENABLE_LLM_FALLBACK:
+            reply = get_llm_reply(text)
+        else:
+            reply = "보안모드: 브릿지 미설정/응답없음. 관리자에게 OPENCLAW_WEBHOOK_URL 설정을 요청하세요."
 
     await update.message.reply_text(reply[:3500])
 
