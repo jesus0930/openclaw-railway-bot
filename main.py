@@ -70,7 +70,8 @@ def _upstream_headers() -> dict:
 
 def _chat_completions_url(base_or_full: str) -> str:
     u = base_or_full.rstrip("/")
-    if u.endswith("/v1/chat/completions"):
+    # supports OpenAI-compatible full path and simple proxy path (/chat)
+    if u.endswith("/v1/chat/completions") or u.endswith("/chat"):
         return u
     return u + "/v1/chat/completions"
 
