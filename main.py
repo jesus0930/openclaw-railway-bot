@@ -31,6 +31,7 @@ OPENCLAW_WEBHOOK_URL = os.getenv("OPENCLAW_WEBHOOK_URL", "").strip() or (
 )
 OPENCLAW_UPSTREAM_URL = os.getenv("OPENCLAW_UPSTREAM_URL", "").strip()
 OPENCLAW_UPSTREAM_TOKEN = os.getenv("OPENCLAW_UPSTREAM_TOKEN", "").strip()
+OPENCLAW_UPSTREAM_MODE = os.getenv("OPENCLAW_UPSTREAM_MODE", "webhook").strip().lower()  # webhook|chat
 
 LLM_API_URL = os.getenv(
     "LLM_API_URL",
@@ -56,6 +57,24 @@ def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: in
             return {"text": body}
 
 
+def _upstream_headers() -> dict:
+    headers = {}
+    if OPENCLAW_UPSTREAM_TOKEN:
+        # keep bearer for backward compatibility
+        headers["Authorization"] = f"Bearer {OPENCLAW_UPSTREAM_TOKEN}"
+        # common gateway header variants
+        headers["X-OpenClaw-Token"] = OPENCLAW_UPSTREAM_TOKEN
+        headers["X-Gateway-Token"] = OPENCLAW_UPSTREAM_TOKEN
+    return headers
+
+
+def _chat_completions_url(base_or_full: str) -> str:
+    u = base_or_full.rstrip("/")
+    if u.endswith("/v1/chat/completions"):
+        return u
+    return u + "/v1/chat/completions"
+
+
 def call_openclaw_bridge(text: str, user_id: str, chat_id: str) -> str:
     if not OPENCLAW_WEBHOOK_URL:
         return ""
@@ -69,6 +88,20 @@ def call_openclaw_bridge(text: str, user_id: str, chat_id: str) -> str:
         return str(data.get("reply") or data.get("text") or data.get("message") or "").strip()
     except (HTTPError, URLError, OSError):
         logger.exception("OpenClaw bridge error")
+        return ""
+
+
+def call_upstream_direct(text: str) -> str:
+    if not OPENCLAW_UPSTREAM_URL:
+        return ""
+    url = _chat_completions_url(OPENCLAW_UPSTREAM_URL)
+    body = {"model": LLM_MODEL, "messages": [{"role": "user", "content": text}], "max_tokens": 2048}
+    headers = _upstream_headers()
+    try:
+        data = _post_json(url, body, headers=headers, timeout=90)
+        return (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+    except (HTTPError, URLError, OSError):
+        logger.exception("upstream direct error")
         return ""
 
 
@@ -96,8 +129,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if OPENCLAW_WEBHOOK_URL:
         mode = "openclaw-bridge"
+    elif OPENCLAW_UPSTREAM_URL:
+        mode = "upstream-direct"
+    elif ENABLE_LLM_FALLBACK:
+        mode = "llm-fallback"
     else:
-        mode = "llm-fallback" if ENABLE_LLM_FALLBACK else "bridge-required"
+        mode = "no-backend"
     await update.message.reply_text(f"봇 정상 실행 ✅ (mode={mode})")
 
 
@@ -105,10 +142,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text("권한이 없습니다.")
         return
+    mode = "bridge" if OPENCLAW_WEBHOOK_URL else ("upstream-direct" if OPENCLAW_UPSTREAM_URL else "fallback")
     await update.message.reply_text(
-        f"bridge_url={'set' if OPENCLAW_WEBHOOK_URL else 'missing'}\n"
-        f"bridge_token={'set' if OPENCLAW_WEBHOOK_TOKEN else 'missing'}\n"
-        f"upstream_url={'set' if OPENCLAW_UPSTREAM_URL else 'missing'}\n"
+        f"mode={mode}\n"
+        f"bridge={'on' if OPENCLAW_WEBHOOK_URL else 'off'}\n"
+        f"upstream={'on' if OPENCLAW_UPSTREAM_URL else 'off'}\n"
+        f"upstream_mode={OPENCLAW_UPSTREAM_MODE}\n"
+        f"upstream_token={'set' if OPENCLAW_UPSTREAM_TOKEN else 'missing'}\n"
         f"llm_fallback={ENABLE_LLM_FALLBACK}"
     )
 
@@ -124,7 +164,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     reply = call_openclaw_bridge(text, uid, cid)
     if not reply:
-        reply = get_llm_reply(text) if ENABLE_LLM_FALLBACK else "보안모드: 브릿지 미설정/응답없음"
+        reply = call_upstream_direct(text)
+    if not reply:
+        reply = get_llm_reply(text) if ENABLE_LLM_FALLBACK else "upstream 연결 실패"
 
     await update.message.reply_text(reply[:3500])
 
@@ -149,10 +191,16 @@ def bridge():
         return jsonify({"reply": "upstream_not_configured"}), 503
 
     payload = request.get_json(silent=True) or {}
-    headers = {}
-    if OPENCLAW_UPSTREAM_TOKEN:
-        headers["Authorization"] = f"Bearer {OPENCLAW_UPSTREAM_TOKEN}"
+    headers = _upstream_headers()
+
     try:
+        if OPENCLAW_UPSTREAM_MODE == "chat":
+            text = str(payload.get("text") or "").strip()
+            body = {"model": LLM_MODEL, "messages": [{"role": "user", "content": text}], "max_tokens": 2048}
+            data = _post_json(_chat_completions_url(OPENCLAW_UPSTREAM_URL), body, headers=headers, timeout=90)
+            content = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+            return jsonify({"reply": content})
+
         data = _post_json(OPENCLAW_UPSTREAM_URL, payload, headers=headers, timeout=90)
         return jsonify(data)
     except Exception:
